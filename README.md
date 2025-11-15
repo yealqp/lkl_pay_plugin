@@ -1,6 +1,6 @@
 # zjmf_lkl_plugin  魔方财务对接拉卡拉支付插件
 
-作者 yealqp
+作者 yealqp  QQ:1592239257
 
 由于我不怎么会写php，所以我用了python后端的形式
 

@@ -6,6 +6,18 @@ return [
         'value' => '',
         'tip'   => '以http://或https://开头，不以/结尾',
     ],
+    'api_secret_key' => [
+        'title' => 'API密钥',
+        'type'  => 'text',
+        'value' => '',
+        'tip'   => '与Python配置的API_SECRET_KEY保持一致，用于API认证',
+    ],
+    'callback_secret' => [
+        'title' => '回调签名密钥',
+        'type'  => 'text',
+        'value' => '',
+        'tip'   => '与Python配置的CALLBACK_SECRET保持一致，用于验证回调签名（非常重要！）',
+    ],
     'currency' => [
         'title' => '支持货币单位',
         'type'  => 'text',

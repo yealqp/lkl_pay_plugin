@@ -5,12 +5,14 @@ import json
 import logging
 import uvicorn
 import requests
+import hashlib
+import hmac
 from urllib.parse import urlparse, parse_qs, unquote
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
-from typing import Union
+from typing import Union, Optional
 
 app = FastAPI()
 
@@ -89,17 +91,64 @@ def get_currency_default():
     return CONFIG.get("CURRENCY") or os.getenv("CURRENCY", "CNY")
 
 
+def generate_signature(data: dict, secret: str) -> str:
+    """
+    生成签名：对数据进行签名以防止篡改
+    """
+    # 按key排序
+    sorted_items = sorted(data.items())
+    # 拼接字符串
+    sign_str = "&".join([f"{k}={v}" for k, v in sorted_items]) + f"&key={secret}"
+    # 计算MD5
+    return hashlib.md5(sign_str.encode('utf-8')).hexdigest().upper()
+
+
+def verify_api_key(api_key: Optional[str] = Header(None, alias="X-API-Key")) -> bool:
+    """
+    验证API密钥
+    """
+    expected_key = CONFIG.get("API_SECRET_KEY") or os.getenv("API_SECRET_KEY")
+    if not expected_key:
+        # 如果未配置密钥，警告但允许通过（向后兼容）
+        logger.warning("未配置API_SECRET_KEY，建议配置以增强安全性")
+        return True
+    
+    if not api_key or api_key != expected_key:
+        raise HTTPException(status_code=401, detail="无效的API密钥")
+    return True
+
+
+# 已处理的订单号缓存（防重放攻击）
+processed_orders = set()
+MAX_PROCESSED_ORDERS = 10000  # 最多缓存1万个订单号
+
+
 @app.post("/lakala/create_order")
-def create_order(req: CreateOrderReq):
+def create_order(req: CreateOrderReq, api_key: Optional[str] = Header(None, alias="X-API-Key")):
     """
     创建拉卡拉收银台订单并返回支付链接
+    需要API密钥认证（如果配置了API_SECRET_KEY）
     """
-    # 记录收到的请求
+    # API密钥验证
+    verify_api_key(api_key)
+    
+    # 验证 notify_url 是否在白名单中
+    allowed_domains = CONFIG.get("ALLOWED_CALLBACK_DOMAINS") or []
+    if allowed_domains:
+        notify_domain = urlparse(req.notify_url).netloc
+        if notify_domain not in allowed_domains:
+            logger.error(f"回调域名不在白名单中: {notify_domain}")
+            raise HTTPException(status_code=403, detail="回调地址不被允许")
+    
+    # 记录收到的请求（隐藏敏感信息）
     logger.info("="*80)
     logger.info("收到创建订单请求")
-    logger.info(f"请求体: {json.dumps(req.dict(), ensure_ascii=False, indent=2)}")
+    safe_req = req.dict()
+    logger.info(f"请求体: invoice_id={safe_req['invoice_id']}, amount={safe_req['tradeAmount']}")
     
     merch_id = CONFIG.get("LAKALA_MERCH_ID")
+    key = CONFIG.get("LAKALA_KEY")
+    origin = CONFIG.get("LAKALA_ORIGIN")
     key = CONFIG.get("LAKALA_KEY")
     origin = CONFIG.get("LAKALA_ORIGIN")
 
@@ -322,23 +371,46 @@ def order_watch_loop(pay_order_no: str, invoice_id: str, trade_amount: str, curr
 def post_notify(invoice_id: str, pay_order_no: str, amount: str, currency: str, notify_url: str):
     """
     将支付成功结果POST到PHP的异步回调地址
-    提交字段：invoice_id、payOrderNo、tradeAmount、currency
+    提交字段：invoice_id、payOrderNo、tradeAmount、currency、sign
     """
-    payload = {
+    # 防重放攻击：检查订单是否已处理
+    global processed_orders
+    if pay_order_no in processed_orders:
+        logger.warning(f"订单已处理过，跳过回调: {pay_order_no}")
+        return
+    
+    # 生成签名
+    callback_secret = CONFIG.get("CALLBACK_SECRET") or os.getenv("CALLBACK_SECRET", "default_secret_key_change_me")
+    sign_data = {
         "invoice_id": invoice_id,
         "payOrderNo": pay_order_no,
         "tradeAmount": amount,
         "currency": currency,
     }
+    signature = generate_signature(sign_data, callback_secret)
+    
+    payload = {
+        **sign_data,
+        "sign": signature,
+    }
     headers = {"Content-Type": "application/json"}
     logger.info(f"准备回调PHP: url={notify_url}")
-    logger.info(f"回调payload: {json.dumps(payload, ensure_ascii=False, indent=2)}")
+    logger.info(f"回调payload: invoice_id={invoice_id}, amount={amount}, pay_order_no={pay_order_no}")
     
     try:
         resp = requests.post(notify_url, json=payload, headers=headers, timeout=10)
-        logger.info(f"PHP回调响应: status={resp.status_code}, body={resp.text}")
+        logger.info(f"PHP回调响应: status={resp.status_code}")
         
-        if resp.status_code != 200:
+        if resp.status_code == 200:
+            # 标记订单为已处理
+            processed_orders.add(pay_order_no)
+            # 限制缓存大小
+            if len(processed_orders) > MAX_PROCESSED_ORDERS:
+                # 移除最早的1000个
+                to_remove = list(processed_orders)[:1000]
+                for order in to_remove:
+                    processed_orders.remove(order)
+        else:
             logger.error(f"回调PHP失败: status={resp.status_code}, body={resp.text}")
             raise HTTPException(status_code=500, detail=f"回调PHP失败: {resp.status_code}")
     except Exception as e:

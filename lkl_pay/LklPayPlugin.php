@@ -101,9 +101,20 @@ class LklPayPlugin extends Plugin
     private function postJson($url, $data)
     {
         $ch = curl_init($url);
+        
+        // 从配置获取API密钥
+        $config = $this->config();
+        $apiKey = $config['api_secret_key'] ?? '';
+        
         $headers = [
             'Content-Type: application/json',
         ];
+        
+        // 如果配置了API密钥，添加到请求头
+        if ($apiKey) {
+            $headers[] = 'X-API-Key: ' . $apiKey;
+        }
+        
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_POST, true);

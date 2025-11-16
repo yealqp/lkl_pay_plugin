@@ -1,6 +1,12 @@
 {
-    "LAKALA_MERCH_ID":"1989313148191170561",
-    "LAKALA_KEY":1763124185308,
-    "LAKALA_ORIGIN":"number17631241853080",
-    "LAKALA_CHANNEL_ID": 15
+    "LAKALA_MERCH_ID": "11",
+    "LAKALA_KEY": 11,
+    "LAKALA_ORIGIN": "number11",
+    "LAKALA_CHANNEL_ID": 11,
+    "API_SECRET_KEY": "key",
+    "CALLBACK_SECRET": "key",
+    "ALLOWED_CALLBACK_DOMAINS": [
+        "www.example.com",
+        "example.com"
+    ]
 }

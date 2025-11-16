@@ -7,6 +7,7 @@ import uvicorn
 import requests
 import hashlib
 import hmac
+from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.exceptions import RequestValidationError
@@ -80,7 +81,16 @@ class QueryOrderReq(BaseModel):
 
 
 def lakala_headers():
-    return {"Content-Type": "application/json"}
+    """
+    返回拉卡拉请求需要的请求头，使用Apifox客户端标识
+    """
+    return {
+        "User-Agent": "Apifox/1.0.0 (https://apifox.com)",
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    }
 
 watches = {}
 
@@ -121,6 +131,40 @@ def verify_api_key(api_key: Optional[str] = Header(None, alias="X-API-Key")) -> 
 # 已处理的订单号缓存（防重放攻击）
 processed_orders = set()
 MAX_PROCESSED_ORDERS = 10000  # 最多缓存1万个订单号
+
+# 订单记录文件锁
+order_file_lock = threading.Lock()
+
+
+def save_order_record(order_data: dict):
+    """
+    将订单记录追加保存到单个JSON文件中
+    文件路径: orders/order_records.json
+    格式: 每条记录一行JSON(JSON Lines格式)
+    """
+    try:
+        # 创建订单记录目录
+        orders_dir = os.path.join(os.path.dirname(__file__), "orders")
+        os.makedirs(orders_dir, exist_ok=True)
+        
+        # 单文件存储
+        filepath = os.path.join(orders_dir, "order_records.json")
+        
+        # 添加记录ID和时间戳
+        order_data["record_id"] = f"{order_data.get('pay_order_no', 'unknown')}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        order_data["record_timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 使用线程锁确保并发写入安全
+        with order_file_lock:
+            # 追加模式写入,每条记录一行JSON
+            with open(filepath, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(order_data, ensure_ascii=False) + '\n')
+        
+        logger.info(f"订单记录已保存: {order_data.get('order_type')} - {order_data.get('pay_order_no')}")
+        return filepath
+    except Exception as e:
+        logger.error(f"保存订单记录失败: {e}", exc_info=True)
+        return None
 
 
 @app.post("/lakala/create_order")
@@ -242,6 +286,26 @@ def create_order(req: CreateOrderReq, api_key: Optional[str] = Header(None, alia
     
     logger.info(f"最终提取结果: payUrl={pay_url[:100]}... payOrderNo={pay_order_no}")
 
+    # 保存订单创建记录
+    order_record = {
+        "order_type": "create",
+        "create_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "invoice_id": req.invoice_id,
+        "pay_order_no": pay_order_no,
+        "trade_amount": req.tradeAmount,
+        "currency": get_currency_default(),
+        "remark": req.remark,
+        "notify_url": req.notify_url,
+        "return_url": req.return_url,
+        "pay_url": pay_url,
+        "lakala_response": {
+            "code": body.get("code"),
+            "msg": body.get("msg"),
+            "data": data
+        }
+    }
+    save_order_record(order_record)
+
     # 启动后台轮询支付状态并在成功时回调PHP
     start_order_watch(
         pay_order_no=pay_order_no,
@@ -264,6 +328,14 @@ def create_order(req: CreateOrderReq, api_key: Optional[str] = Header(None, alia
     }
 
 
+@app.get("/health")
+def health_check():
+    """
+    健康检查端点
+    """
+    return {"status": "healthy", "service": "lakala-payment-api"}
+
+
 @app.post("/lakala/query_order")
 def query_order(req: QueryOrderReq):
     """
@@ -277,14 +349,28 @@ def query_order(req: QueryOrderReq):
     }
     url = "https://payment.lakala.com/m/los/api/mch/queryFullOrder"
     logger.info(f"查询订单请求: {json.dumps(payload, ensure_ascii=False)}")
+    
+    # 使用统一的请求头
     resp = requests.post(url, json=payload, headers=lakala_headers(), timeout=10)
     logger.info(f"查询订单响应状态: {resp.status_code}")
+    logger.info(f"响应编码: {resp.encoding}, Content-Encoding: {resp.headers.get('Content-Encoding')}")
+    
     if resp.status_code != 200:
         logger.error(f"查询订单失败: status={resp.status_code}")
+        logger.error(f"响应内容: {resp.text[:500]}")
         raise HTTPException(status_code=resp.status_code, detail="拉卡拉接口错误")
-    body = resp.json()
-    logger.info(f"查询订单响应体: {json.dumps(body, ensure_ascii=False)}")
-    return body
+    
+    # 先输出原始响应文本，再尝试解析JSON
+    logger.info(f"查询订单原始响应(前200字符): {resp.text[:200]}")
+    try:
+        body = resp.json()
+        logger.info(f"查询订单响应体: {json.dumps(body, ensure_ascii=False)}")
+        return body
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON解析失败: {e}")
+        logger.error(f"响应内容类型: {type(resp.content)}, 长度: {len(resp.content)}")
+        logger.error(f"完整响应文本(前500字符): {resp.text[:500]}")
+        raise HTTPException(status_code=500, detail=f"拉卡拉返回非JSON格式: {resp.text[:100]}")
 
 
 def start_order_watch(pay_order_no: str, invoice_id: str, trade_amount: str, currency: str, notify_url: str):
@@ -312,16 +398,17 @@ def start_order_watch(pay_order_no: str, invoice_id: str, trade_amount: str, cur
 
 def order_watch_loop(pay_order_no: str, invoice_id: str, trade_amount: str, currency: str, notify_url: str, stop_flag: threading.Event):
     """
-    订单轮询主循环：每5秒查询拉卡拉订单状态，成功时回调PHP并退出
+    订单轮询主循环：每10秒查询拉卡拉订单状态,最长10分钟(60次),成功时回调PHP并退出
     成功条件：
     - 响应中存在 respData.payStatus 且为 SUCCESS/PAY_SUCCESS/PAID
     - 或者 respData.orderStatus 为 2/"2"/SUCCESS
     """
-    max_attempts = int(CONFIG.get("WATCH_MAX_ATTEMPTS", os.getenv("WATCH_MAX_ATTEMPTS", "720")))  # 默认轮询1小时
+    max_attempts = 60  # 10分钟 = 60次 × 10秒
+    interval = 10  # 每10秒查询一次
     attempts = 0
     channel_id = str(CONFIG.get("LAKALA_CHANNEL_ID", os.getenv("LAKALA_CHANNEL_ID", "15")))
     
-    logger.info(f"开始轮询订单状态: pay_order_no={pay_order_no}, invoice_id={invoice_id}, max_attempts={max_attempts}")
+    logger.info(f"开始轮询订单状态: pay_order_no={pay_order_no}, invoice_id={invoice_id}, 间隔={interval}秒, 最大次数={max_attempts}")
 
     while not stop_flag.is_set() and attempts < max_attempts:
         attempts += 1
@@ -355,17 +442,37 @@ def order_watch_loop(pay_order_no: str, invoice_id: str, trade_amount: str, curr
                     amount = trade_amount
                 
                 logger.info(f"[轮询 {attempts}] 检测到支付成功! 金额转换: {amount_fen}分 -> {amount}元")
+                
+                # 保存支付成功记录
+                payment_record = {
+                    "order_type": "payment_success",
+                    "pay_order_no": pay_order_no,
+                    "invoice_id": invoice_id,
+                    "payment_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "trade_amount": trade_amount,
+                    "actual_amount": amount,
+                    "amount_fen": amount_fen,
+                    "currency": currency,
+                    "poll_attempts": attempts,
+                    "poll_duration_seconds": attempts * interval,
+                    "order_status": order_status,
+                    "pay_status": pay_status,
+                    "lakala_response": resp,
+                    "notify_url": notify_url
+                }
+                save_order_record(payment_record)
+                
                 post_notify(invoice_id, pay_order_no, amount, currency, notify_url)
                 logger.info(f"支付成功回调完成: invoice_id={invoice_id} pay_order_no={pay_order_no} amount={amount}")
                 break
         except Exception as e:
             logger.error(f"[轮询 {attempts}] 轮询出错: pay_order_no={pay_order_no} 错误={e}", exc_info=True)
 
-        time.sleep(5)
+        time.sleep(interval)  # 每10秒查询一次
 
     # 清理标记
     watches.pop(pay_order_no, None)
-    logger.info(f"订单轮询结束: pay_order_no={pay_order_no}, 总尝试次数={attempts}")
+    logger.info(f"订单轮询结束: pay_order_no={pay_order_no}, 总尝试次数={attempts}, 总耗时={attempts*interval}秒")
 
 
 def post_notify(invoice_id: str, pay_order_no: str, amount: str, currency: str, notify_url: str):
@@ -397,9 +504,30 @@ def post_notify(invoice_id: str, pay_order_no: str, amount: str, currency: str, 
     logger.info(f"准备回调PHP: url={notify_url}")
     logger.info(f"回调payload: invoice_id={invoice_id}, amount={amount}, pay_order_no={pay_order_no}")
     
+    callback_start_time = datetime.now()
     try:
         resp = requests.post(notify_url, json=payload, headers=headers, timeout=10)
-        logger.info(f"PHP回调响应: status={resp.status_code}")
+        callback_end_time = datetime.now()
+        callback_duration = (callback_end_time - callback_start_time).total_seconds()
+        
+        logger.info(f"PHP回调响应: status={resp.status_code}, 耗时={callback_duration:.2f}秒")
+        
+        # 保存回调记录
+        callback_record = {
+            "order_type": "callback",
+            "pay_order_no": pay_order_no,
+            "invoice_id": invoice_id,
+            "callback_time": callback_start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "notify_url": notify_url,
+            "callback_payload": payload,
+            "callback_response": {
+                "status_code": resp.status_code,
+                "body": resp.text[:500] if resp.text else None,
+                "duration_seconds": callback_duration
+            },
+            "success": resp.status_code == 200
+        }
+        save_order_record(callback_record)
         
         if resp.status_code == 200:
             # 标记订单为已处理
@@ -414,7 +542,22 @@ def post_notify(invoice_id: str, pay_order_no: str, amount: str, currency: str, 
             logger.error(f"回调PHP失败: status={resp.status_code}, body={resp.text}")
             raise HTTPException(status_code=500, detail=f"回调PHP失败: {resp.status_code}")
     except Exception as e:
+        callback_end_time = datetime.now()
+        callback_duration = (callback_end_time - callback_start_time).total_seconds()
+        
         logger.error(f"回调PHP异常: {e}", exc_info=True)
+        
+        # 保存回调失败记录
+        error_record = {
+            "order_type": "callback_error",
+            "pay_order_no": pay_order_no,
+            "invoice_id": invoice_id,
+            "callback_time": callback_start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "notify_url": notify_url,
+            "error": str(e),
+            "duration_seconds": callback_duration
+        }
+        save_order_record(error_record)
         raise
 
 
